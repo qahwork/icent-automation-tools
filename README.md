@@ -18,16 +18,14 @@ Cisco 유지보수 대상 장비 관리를 위한 엑셀 자동화 도구입니�
 ```bash
 pip install -r requirements.txt
 ```
-## 🚀 실행 방법
-bash
-Copy
-Edit
-# 시리얼 추출
-python serial_extractor.py
+## 🚀 가상환경 구성
 
-# 엑셀 업데이트
-python excel_updater.py
-yaml
-Copy
-Edit
-
+### 1. Windows 기준
+```bash
+python -m venv venv
+venv\Scripts\activate
+```
+2. 의존성 설치
+```bash
+pip install -r requirements.txt
+```
