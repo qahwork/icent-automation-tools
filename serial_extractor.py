@@ -28,7 +28,6 @@ for filename in os.listdir(current_path):
                 for serial in raw_serials:
                     cleaned = serial.strip()
                     cleaned = re.sub(r'\s+', '', cleaned)
-                    cleaned = re.sub(r'[^A-Za-z0-9]', '', cleaned)
                     if cleaned:
                         serial_records.append({'Serial': cleaned, 'Filename': filename})
             else:
