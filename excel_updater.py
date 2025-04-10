@@ -21,7 +21,6 @@ def parse_excel_date(date_str):
 
 # ------------------------------------------------------------------------------
 # 1. LineDetails CSV 파일(들) 처리
-# 현재 디렉토리 내 "LineDetails"로 시작하고 ".csv"로 끝나는 모든 파일을 수집
 linedetail_files = [f for f in os.listdir() if f.startswith("LineDetails") and f.endswith(".csv")]
 
 csv_dataframes = []
@@ -32,7 +31,6 @@ for filename in linedetail_files:
         with open(filename, "r", encoding="utf-8") as f:
             header_lines = [next(f) for _ in range(5)]
         # 헤더 5행 중 "Date"가 포함된 행을 검색하여 날짜를 추출
-        # 예: "Date	9-Apr-25" 또는 "Date 9-Apr-25"
         for line in header_lines:
             if "Date" in line:
                 parts = re.split(r'\t|\s{2,}', line.strip())
@@ -111,10 +109,13 @@ for _, row in linedetails_df.iterrows():
     if model_name:
         entry["모델명PID"] = model_name
 
-    # 계약번호 업데이트
+    # 계약번호 업데이트: 정수로 변환하여 저장
     contract_num = row.get("Subscription ID/Contract Number", "").strip()
-    if contract_num:
-        entry["계약번호\n(Contract)"] = contract_num
+    if contract_num and contract_num.isdigit():
+        entry["계약번호\n(Contract)"] = int(contract_num)  # 정수로 변환하여 저장
+    elif contract_num:
+        print(f"⚠️ 계약번호가 숫자가 아니어서 변환되지 않았습니다: {contract_num}")
+
 # ------------------------------------------------------------------------------
 # 3. serials.csv와 LineDetails CSV의 시리얼 비교 (problem_serial.csv 생성)
 serials_csv_path = os.path.join(os.getcwd(), "serials.csv")
@@ -204,36 +205,17 @@ for filename in os.listdir():
                     break
             col_indices[key] = found
 
-        # 헤더 매핑에서 확인요청(confirm_col)나 계약번호(contract_col)이 없으면,
-        # 엑셀 파일에 새 열을 추가 (맨 마지막 열)
-        max_index = len(headers)
-        if col_indices["confirm_col"] is None:
-            col_indices["confirm_col"] = max_index
-            headers.append("확인요청")
-            max_index += 1
-        if col_indices["contract_col"] is None:
-            col_indices["contract_col"] = max_index
-            headers.append("계약번호\n(Contract)")
-            max_index += 1
-
-        # 필수 컬럼 헤더 매핑 체크 (serial_col, ldos_date_col, service_type_col, end_date_active_col, end_date_signed_col, model_pid_col)
-        required_keys = ["serial_col", "ldos_date_col", "service_type_col", 
-                         "end_date_active_col", "end_date_signed_col", "model_pid_col"]
-        failed = False
-        for k in required_keys:
-            if col_indices[k] is None:
-                print(f"\n[❌ 헤더 매핑 실패] {filename} - '{k}'에 해당하는 열을 찾을 수 없음 (후보: {column_candidates[k]})")
-                failed = True
-        if failed:
-            print("엑셀 헤더 목록:")
-            for i, h in enumerate(headers):
-                print(f"  - [{i}] '{h}' → 정규화: '{normalize(h)}'")
-            continue
-
+        # 업데이트된 내용 처리 (serial_map에서 값 업데이트)
         updated = 0
         debug_printed = False
 
-        # 2행부터 데이터 처리
+        def update_value(cell, new_value):
+            if new_value == "-" or not new_value:  # 새 값이 공백 또는 "-"인 경우
+                return cell.value  # 원본 값을 그대로 유지
+            if cell.value == new_value:  # 원본 값과 새 값이 동일한 경우
+                return cell.value  # 원본 값을 그대로 유지
+            return new_value  # 그 외에는 새 값을 적용
+
         for row in ws.iter_rows(min_row=2):
             serial_cell = row[col_indices["serial_col"]]
             serial = str(serial_cell.value).strip() if serial_cell.value is not None else ""
@@ -246,23 +228,23 @@ for filename in os.listdir():
                     print(f"\n🔍 디버그 (1회) - {serial} → {info}")
                     debug_printed = True
 
-                row[col_indices["ldos_date_col"]].value = info["LDoS"] if info["LDoS"] != "-" else "-"
-                row[col_indices["service_type_col"]].value = info["서비스 종류"] if info["서비스 종류"] else "-"
-                row[col_indices["end_date_active_col"]].value = info["ACTIVE 종료일"] if info["ACTIVE 종료일"] != "-" else "-"
-                row[col_indices["end_date_signed_col"]].value = info["SIGNED 종료일"] if info["SIGNED 종료일"] != "-" else "-"
-                row[col_indices["model_pid_col"]].value = info["모델명PID"] if info["모델명PID"] else "-"
-                row[col_indices["contract_col"]].value = info["계약번호\n(Contract)"] if info["계약번호\n(Contract)"] else "-"
+                # 각 셀에 값 업데이트
+                row[col_indices["ldos_date_col"]].value = update_value(row[col_indices["ldos_date_col"]], info["LDoS"])
+                row[col_indices["service_type_col"]].value = update_value(row[col_indices["service_type_col"]], info["서비스 종류"])
+                row[col_indices["end_date_active_col"]].value = update_value(row[col_indices["end_date_active_col"]], info["ACTIVE 종료일"])
+                row[col_indices["end_date_signed_col"]].value = update_value(row[col_indices["end_date_signed_col"]], info["SIGNED 종료일"])
+                row[col_indices["model_pid_col"]].value = update_value(row[col_indices["model_pid_col"]], info["모델명PID"])
+
+                # 계약번호는 정수로 저장
+                row[col_indices["contract_col"]].value = update_value(row[col_indices["contract_col"]], int(info["계약번호\n(Contract)"]) if isinstance(info["계약번호\n(Contract)"], int) else info["계약번호\n(Contract)"])
             else:
                 # CSV에 해당 시리얼이 없으면 '확인요청' 열에 "CCW 검색불가" 기록
                 row[col_indices["confirm_col"]].value = "CCW 검색불가"
             updated += 1
 
         wb.save(filename)
-        print(f"✅ [UPDATED] {filename} - 총 {updated}건 업데이트 완료")
-
-        # 파일명 변경: 파일명의 마지막 한글 뒤에 _yyyy_mm_dd_업데이트 추가
-        new_filename = rename_file_with_date(filename)
-        print(f"✅ 파일명 변경: {filename} → {new_filename}")
+        renamed_file = rename_file_with_date(filename)
+        print(f"✅ 파일 저장 완료: {renamed_file}")
 
     except Exception as e:
-        print(f"[ERROR] {filename} 처리 중 오류 발생: {e}")
+        print(f"[ERROR] '{filename}' 처리 중 오류 발생: {e}")
