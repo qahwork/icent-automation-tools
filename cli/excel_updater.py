@@ -1,250 +1,189 @@
 import os
 import re
-import glob
 import pandas as pd
 from openpyxl import load_workbook
 from datetime import datetime
+import logging
+from configparser import ConfigParser
 
-# 날짜 파싱 함수 (엑셀 날짜 변환)
-def parse_excel_date(date_str):
-    if not date_str or date_str.strip() in ["-", "N"]:
-        return "-"
-    date_str = date_str.strip()
-    formats = ["%d-%b-%y", "%d-%b-%Y", "%d-%B-%Y", "%Y/%m/%d", "%m/%d/%Y", "%d/%m/%Y"]
-    for fmt in formats:
-        try:
-            return datetime.strptime(date_str, fmt).date()
-        except ValueError:
+from core.utils import parse_excel_date, rename_file_with_date, normalize, get_logger
+
+# 로거 설정
+logger = get_logger("excel_updater")
+
+# 설정 파일 읽기
+config = ConfigParser()
+config.read(os.path.join(os.path.dirname(__file__), '..', 'config', 'config.ini'))
+
+# 설정값
+header_skip_lines = config.getint('DEFAULT', 'header_skip_lines', fallback=5)
+sheet_name = config.get('EXCEL', 'sheet_name', fallback="유지보수 대상장비")
+output_dir = config.get('OUTPUT', 'output_dir', fallback="outputs")
+
+# serial_map을 생성하는 함수 예시
+def build_serial_map(linedetails_df):
+    serial_map = {}
+    for _, row in linedetails_df.iterrows():
+        serial = row.get("PAK/Serial Number", "").strip()
+        status = row.get("Status", "").strip().upper()
+        if not serial:
             continue
-    print(f"⚠️ 날짜 변환 실패: {date_str}")
-    return "-"
+        entry = serial_map.setdefault(serial, {
+            "LDoS": "-",
+            "서비스 종류": "-",
+            "ACTIVE 종료일": "-",
+            "SIGNED 종료일": "-",
+            "모델명PID": "-",
+            "계약번호": "-"
+        })
+        description = row.get("Description", "").strip()
+        # meraki 체크 (대소문자 무시)
+        if "meraki" in description.lower():
+            ldos_raw = row.get("Last Date of Support", "").strip()
+            new_ldos = parse_excel_date(ldos_raw)
+            if (not entry["LDoS"] or entry["LDoS"] == "-") and new_ldos != "-":
+                entry["LDoS"] = new_ldos
+        model_name = row.get("Product /Offer Name", "").strip()
+        if model_name:
+            entry["모델명PID"] = model_name
+            continue
 
-# ------------------------------------------------------------------------------
-# 1. LineDetails CSV 파일(들) 처리
-linedetail_files = [f for f in os.listdir() if f.startswith("LineDetails") and f.endswith(".csv")]
-
-csv_dataframes = []
-file_dates = {}  # 각 파일에서 추출한 날짜를 저장 (디버깅용)
-
-for filename in linedetail_files:
-    try:
-        with open(filename, "r", encoding="utf-8") as f:
-            header_lines = [next(f) for _ in range(5)]
-        # 헤더 5행 중 "Date"가 포함된 행을 검색하여 날짜를 추출
-        for line in header_lines:
-            if "Date" in line:
-                parts = re.split(r'\t|\s{2,}', line.strip())
-                if len(parts) >= 2:
-                    file_dates[filename] = parts[1]
-                break
-
-        # 상단 5행을 건너뛰고 CSV 데이터 읽기
-        df = pd.read_csv(filename, skiprows=5, dtype=str).fillna("")
-        csv_dataframes.append(df)
-    except Exception as e:
-        print(f"[ERROR] '{filename}' 처리 중 오류 발생: {e}")
-
-if not csv_dataframes:
-    raise FileNotFoundError("LineDetails 관련 CSV 파일을 찾을 수 없습니다.")
-
-# 여러 CSV 파일을 하나의 DataFrame으로 결합
-linedetails_df = pd.concat(csv_dataframes, ignore_index=True)
-
-# ------------------------------------------------------------------------------
-# 2. Serial Map 생성 from LineDetails CSV 데이터
-serial_map = {}
-for _, row in linedetails_df.iterrows():
-    serial = row.get("PAK/Serial Number", "").strip()
-    status = row.get("Status", "").strip().upper()
-    if not serial:
-        continue
-
-    # 기본값 설정: 각 필드가 비어있을 때만 이후 업데이트하도록 "-"로 초기화함
-    entry = serial_map.setdefault(serial, {
-        "LDoS": "-", 
-        "서비스 종류": "-", 
-        "ACTIVE 종료일": "-", 
-        "SIGNED 종료일": "-", 
-        "모델명PID": "-", 
-        "계약번호\n(Contract)": "-"
-    })
-
-    # 추가: Description 열에서 "meraki" (대소문자 무시) 포함 여부 확인
-    description = row.get("Description", "").strip()
-    if "meraki" in description.lower():
-        # meraki가 포함된 경우에는 LDoS만 업데이트
         ldos_raw = row.get("Last Date of Support", "").strip()
         new_ldos = parse_excel_date(ldos_raw)
-        # 현재 LDoS가 비어있거나 "-"인 경우에만 업데이트 (그리고 새 값이 "-"가 아닐 때)
-        if (not entry["LDoS"] or entry["LDoS"] == "-") and new_ldos != "-":
+        if new_ldos != "-" or entry["LDoS"] in ["", "-"]:
             entry["LDoS"] = new_ldos
-        # 다른 필드는 업데이트하지 않고 다음 row로 넘어감
-        continue
 
-    # 일반적으로 업데이트하는 경우: 각 필드는 새 값이 있을 때만 업데이트함
+        offer_type = row.get("Service Level/Offer Type", "").strip()
+        if offer_type:
+            entry["서비스 종류"] = offer_type
 
-    # LDoS 업데이트: 새 값이 "-"가 아니거나 현재 값이 비어있을 경우만 업데이트
-    ldos_raw = row.get("Last Date of Support", "").strip()
-    new_ldos = parse_excel_date(ldos_raw)
-    if new_ldos != "-" or entry["LDoS"] in ["", "-"]:
-        entry["LDoS"] = new_ldos
+        end_date_raw = row.get("End Date", "").strip()
+        end_date_parsed = parse_excel_date(end_date_raw)
+        if status == "ACTIVE":
+            if end_date_parsed != "-" or entry["ACTIVE 종료일"] in ["", "-"]:
+                entry["ACTIVE 종료일"] = end_date_parsed
+        elif status == "SIGNED":
+            if end_date_parsed != "-" or entry["SIGNED 종료일"] in ["", "-"]:
+                entry["SIGNED 종료일"] = end_date_parsed
 
-    # 서비스 종류 업데이트: 값이 존재할 경우 업데이트
-    offer_type = row.get("Service Level/Offer Type", "").strip()
-    if offer_type:
-        entry["서비스 종류"] = offer_type
+        model_name = row.get("Product /Offer Name", "").strip()
+        if model_name:
+            entry["모델명PID"] = model_name
 
-    # End Date 업데이트 (ACTIVE 또는 SIGNED 상태에 따라)
-    end_date_raw = row.get("End Date", "").strip()
-    end_date_parsed = parse_excel_date(end_date_raw)
-    if status == "ACTIVE":
-        if end_date_parsed != "-" or entry["ACTIVE 종료일"] in ["", "-"]:
-            entry["ACTIVE 종료일"] = end_date_parsed
-    elif status == "SIGNED":
-        if end_date_parsed != "-" or entry["SIGNED 종료일"] in ["", "-"]:
-            entry["SIGNED 종료일"] = end_date_parsed
+        contract_num = row.get("Subscription ID/Contract Number", "").strip()
+        if contract_num and contract_num.isdigit():
+            entry["계약번호"] = int(contract_num)
+        elif contract_num:
+            logger.warning(f"⚠️ 계약번호가 숫자가 아니어서 변환되지 않았습니다: {contract_num}")
+    return serial_map
 
-    # 모델명PID 업데이트
-    model_name = row.get("Product /Offer Name", "").strip()
-    if model_name:
-        entry["모델명PID"] = model_name
-
-    # 계약번호 업데이트: 정수로 변환하여 저장
-    contract_num = row.get("Subscription ID/Contract Number", "").strip()
-    if contract_num and contract_num.isdigit():
-        entry["계약번호\n(Contract)"] = int(contract_num)  # 정수로 변환하여 저장
-    elif contract_num:
-        print(f"⚠️ 계약번호가 숫자가 아니어서 변환되지 않았습니다: {contract_num}")
-
-# ------------------------------------------------------------------------------
-# 3. serials.csv와 LineDetails CSV의 시리얼 비교 (problem_serial.csv 생성)
-serials_csv_path = os.path.join(os.getcwd(), "serials.csv")
-if not os.path.exists(serials_csv_path):
-    raise FileNotFoundError(f"serials.csv 파일을 찾을 수 없습니다. ({serials_csv_path})")
-serials_df = pd.read_csv(serials_csv_path, dtype=str).fillna("")
-# serials.csv는 'Serials' 컬럼에 시리얼 번호가 들어있다고 가정
-serials_list = serials_df["Serial"].astype(str).str.strip().tolist()
-
-# LineDetails에서 확인된 시리얼 집합
-linedetail_serials = set(serial_map.keys())
-
-# serials.csv에 있으나 LineDetails에 없는 시리얼 추출
-problem_serials = [s for s in serials_list if s not in linedetail_serials]
-
-# Filename 추가
-serials_df['Filename'] = serials_df['Filename'].fillna("")  # Filename 컬럼이 없으면 빈 문자열 처리
-problem_filenames = serials_df.loc[serials_df['Serial'].isin(problem_serials), 'Filename'].tolist()
-
-# 문제 시리얼과 파일명 결합
-problem_data = list(zip(problem_serials, problem_filenames))
-
-# 문제 시리얼과 파일명을 포함한 DataFrame 생성
-problem_df = pd.DataFrame(problem_data, columns=["Problem Serials", "Filename"])
-
-# 문제 시리얼 CSV 파일 경로 지정
-problem_csv_path = os.path.join(os.getcwd(), "problem_serial.csv")
-problem_df.to_csv(problem_csv_path, index=False, encoding="utf-8-sig")
-print(f"✅ 문제 시리얼 저장: {problem_csv_path}")
-
-# ------------------------------------------------------------------------------
-# 4. XLSX 파일 처리 및 업데이트 후 파일명 변경
-# 엑셀 파일에서 갱신 대상 시트: "유지보수 대상장비"
-def normalize(text):
-    return str(text).replace("\n", "").replace(" ", "").strip() if text is not None else ""
-
-# 각 컬럼 후보 지정
-column_candidates = {
-    "serial_col": ["시리얼"],
-    "ldos_date_col": ["H/WLDoSDate", "H/WEOS(Support)날짜"],
-    "service_type_col": ["서비스종류Subscription/ServiceLevel", "서비스종류"],
-    "end_date_active_col": ["서비스종료일(Active)"],
-    "end_date_signed_col": ["서비스종료일(SIGNED)"],
-    "model_pid_col": ["모델명PID", "모델명\nPID"],
-    "confirm_col": ["확인요청"],
-    "contract_col": ["계약번호\n(Contract)", "Subscription ID/Contract Number"]
-}
-
-# 파일명 변경 함수: 파일명의 마지막 한글 문자 뒤에 _yyyy_mm_dd_업데이트 삽입
-def rename_file_with_date(original_file):
-    base, ext = os.path.splitext(original_file)
-    # 마지막 한글 문자의 위치 찾기 (정규표현식 사용)
-    matches = list(re.finditer(r"[가-힣]", base))
-    # 현재 날짜 문자열 생성 (예: 2025_04_10)
-    date_str = datetime.now().strftime("%Y_%m_%d")
-    if matches:
-        last_match = matches[-1]
-        new_base = base[:last_match.end()] + f"_{date_str}_update"
-    else:
-        new_base = base + f"_{date_str}_update"
-    new_name = new_base + ext
-    os.rename(original_file, new_name)
-    return new_name
-
-# XLSX 파일 처리
-for filename in os.listdir():
-    if not filename.endswith(".xlsx"):
-        continue
-
-    try:
-        wb = load_workbook(filename)
-        if "유지보수 대상장비" not in wb.sheetnames:
-            print(f"[SKIP] 시트 없음: {filename}")
+def update_excel_files(serial_map):
+    # 현재 폴더 내의 모든 Excel 파일 처리
+    for filename in os.listdir():
+        if not filename.endswith(".xlsx"):
             continue
-
-        ws = wb["유지보수 대상장비"]
-        headers = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
-        header_map = {normalize(h): i for i, h in enumerate(headers)}
-
-        col_indices = {}
-        for key, candidates in column_candidates.items():
-            found = None
-            for c in candidates:
-                norm_c = normalize(c)
-                if norm_c in header_map:
-                    found = header_map[norm_c]
-                    break
-            col_indices[key] = found
-
-        # 업데이트된 내용 처리 (serial_map에서 값 업데이트)
-        updated = 0
-        debug_printed = False
-
-        def update_value(cell, new_value):
-            if new_value == "-" or not new_value:  # 새 값이 공백 또는 "-"인 경우
-                return cell.value  # 원본 값을 그대로 유지
-            if cell.value == new_value:  # 원본 값과 새 값이 동일한 경우
-                return cell.value  # 원본 값을 그대로 유지
-            return new_value  # 그 외에는 새 값을 적용
-
-        for row in ws.iter_rows(min_row=2):
-            serial_cell = row[col_indices["serial_col"]]
-            serial = str(serial_cell.value).strip() if serial_cell.value is not None else ""
-            if not serial:
+        try:
+            wb = load_workbook(filename)
+            if sheet_name not in wb.sheetnames:
+                logger.info(f"[SKIP] 시트 없음: {filename}")
                 continue
+            ws = wb[sheet_name]
+            headers = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+            # header_map: normalize 처리 후 인덱스를 매핑
+            header_map = {normalize(h): i for i, h in enumerate(headers)}
 
-            if serial in serial_map:
-                info = serial_map[serial]
-                if not debug_printed:
-                    print(f"\n🔍 디버그 (1회) - {serial} → {info}")
-                    debug_printed = True
+            # 컬럼 후보는 config 파일이나 아래와 같이 직접 지정
+            column_candidates = {
+                "serial": config.get('EXCEL', 'serial_column', fallback="시리얼"),
+                "ldos_date": config.get('EXCEL', 'ldos_date_candidates', fallback="").split(','),
+                "service_type": config.get('EXCEL', 'service_type_candidates', fallback="").split(','),
+                "end_date_active": config.get('EXCEL', 'end_date_active', fallback="서비스종료일(Active)"),
+                "end_date_signed": config.get('EXCEL', 'end_date_signed', fallback="서비스종료일(SIGNED)"),
+                "model_pid": config.get('EXCEL', 'model_pid', fallback="모델명PID"),
+                "confirm": "확인요청",
+                "contract": config.get('EXCEL', 'contract_column', fallback="계약번호")
+            }
 
-                # 각 셀에 값 업데이트
-                row[col_indices["ldos_date_col"]].value = update_value(row[col_indices["ldos_date_col"]], info["LDoS"])
-                row[col_indices["service_type_col"]].value = update_value(row[col_indices["service_type_col"]], info["서비스 종류"])
-                row[col_indices["end_date_active_col"]].value = update_value(row[col_indices["end_date_active_col"]], info["ACTIVE 종료일"])
-                row[col_indices["end_date_signed_col"]].value = update_value(row[col_indices["end_date_signed_col"]], info["SIGNED 종료일"])
-                row[col_indices["model_pid_col"]].value = update_value(row[col_indices["model_pid_col"]], info["모델명PID"])
+            # 컬럼 인덱스를 찾기
+            col_indices = {}
+            for key, cand in column_candidates.items():
+                if isinstance(cand, list):
+                    found = None
+                    for c in cand:
+                        norm_c = normalize(c)
+                        if norm_c in header_map:
+                            found = header_map[norm_c]
+                            break
+                    col_indices[key] = found
+                else:
+                    col_indices[key] = header_map.get(normalize(cand))
+            # 업데이트 시작
+            debug_printed = False
+            for row in ws.iter_rows(min_row=2):
+                serial_cell = row[col_indices["serial"]]
+                serial = str(serial_cell.value).strip() if serial_cell.value is not None else ""
+                if not serial:
+                    continue
+                if serial in serial_map:
+                    info = serial_map[serial]
+                    if not debug_printed:
+                        logger.debug(f"Debug: {serial} → {info}")
+                        debug_printed = True
+                    # 업데이트 각 셀
+                    for key in ["ldos_date", "service_type", "end_date_active", "end_date_signed", "model_pid"]:
+                        if col_indices.get(key) is not None:
+                            old_value = row[col_indices[key]].value
+                            new_value = info.get({
+                                "ldos_date": "LDoS",
+                                "service_type": "서비스 종류",
+                                "end_date_active": "ACTIVE 종료일",
+                                "end_date_signed": "SIGNED 종료일",
+                                "model_pid": "모델명PID"
+                            }[key])
+                            # 새 값이 "-" 또는 빈 값인 경우 기존 값 유지
+                            if new_value != "-" and new_value and new_value != old_value:
+                                row[col_indices[key]].value = new_value
+                    # 계약번호 처리 (정수형 변환이 필요한 경우)
+                    if col_indices.get("contract") is not None:
+                        contract_info = info.get("계약번호")
+                        if isinstance(contract_info, int):
+                            row[col_indices["contract"]].value = contract_info
+                        elif contract_info:
+                            row[col_indices["contract"]].value = contract_info
+                else:
+                    # 없는 시리얼의 경우 '확인요청' 열에 기록
+                    if col_indices.get("confirm") is not None:
+                        row[col_indices["confirm"]].value = "CCW 검색불가"
+            wb.save(filename)
+            new_name = rename_file_with_date(filename)
+            logger.info(f"✅ 파일 저장 완료: {new_name}")
+        except Exception as e:
+            logger.error(f"[ERROR] '{filename}' 처리 중 오류 발생: {e}")
 
-                # 계약번호는 정수로 저장
-                row[col_indices["contract_col"]].value = update_value(row[col_indices["contract_col"]], int(info["계약번호\n(Contract)"]) if isinstance(info["계약번호\n(Contract)"], int) else info["계약번호\n(Contract)"])
-            else:
-                # CSV에 해당 시리얼이 없으면 '확인요청' 열에 "CCW 검색불가" 기록
-                row[col_indices["confirm_col"]].value = "CCW 검색불가"
-            updated += 1
+def main():
+    # 여기는 CSV 또는 다른 데이터 소스로부터 serial_map을 만드는 코드 예시입니다.
+    # 실제 구현에서는 적절한 파일 읽기/병합 로직을 추가합니다.
+    csv_files = [f for f in os.listdir() if f.startswith("LineDetails") and f.endswith(".csv")]
+    if not csv_files:
+        logger.error("LineDetails CSV 파일을 찾을 수 없습니다.")
+        return
 
-        wb.save(filename)
-        renamed_file = rename_file_with_date(filename)
-        print(f"✅ 파일 저장 완료: {renamed_file}")
+    csv_dataframes = []
+    for filename in csv_files:
+        try:
+            # 헤더 5행 스킵 (config 기반으로 조정 가능)
+            df = pd.read_csv(filename, skiprows=header_skip_lines, dtype=str).fillna("")
+            csv_dataframes.append(df)
+        except Exception as ex:
+            logger.error(f"[ERROR] '{filename}' 처리 중 오류: {ex}")
 
-    except Exception as e:
-        print(f"[ERROR] '{filename}' 처리 중 오류 발생: {e}")
+    if not csv_dataframes:
+        logger.error("CSV 데이터 읽기 실패.")
+        return
+
+    combined_df = pd.concat(csv_dataframes, ignore_index=True)
+    serial_map = build_serial_map(combined_df)
+    update_excel_files(serial_map)
+
+if __name__ == '__main__':
+    main()
